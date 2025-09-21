@@ -39,14 +39,17 @@ ensure_packages() {
 
 write_strongswan_conf() {
   info "Writing /etc/strongswan.conf …"
-  cat >/etc/strongswan.conf <<EOF
+  cat >/etc/strongswan.conf <<'EOF'
 charon {
     load_modular = yes
     plugins {
-      vici {
-          load = yes
-      }
-      include strongswan.d/charon/*.conf
+        vici {
+            load = yes
+        }
+        tpm {
+            load = no
+        }
+        include strongswan.d/charon/*.conf
     }
     filelog {
         charon-log {
@@ -62,6 +65,7 @@ charon {
     }
 }
 EOF
+
 }
 
 enable_forwarding() {
