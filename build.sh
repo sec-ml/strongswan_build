@@ -94,33 +94,101 @@ ensure_dirs() {
     info "Creating directories…"
     mkdir -p "$SWAN_DIR"/{private,x509ca,x509} "$CLIENTS_BASE"
     chmod 700 "$SWAN_DIR/private"
+    
+    # Clean up any corrupted files
+    info "Cleaning up any corrupted certificate files..."
+    rm -f "$SWAN_DIR"/*.srl
+    rm -f "$SWAN_DIR"/x509ca/*.srl
+    rm -f "$SWAN_DIR"/x509/*.srl
 }
 
 ensure_ca_and_server() {
     info "Generating CA and server certificates…"
     
     if [[ ! -f "$CA_KEY" ]]; then
-        pki --gen --type rsa --size 4096 --outform pem > "$CA_KEY"
+        info "Generating CA private key..."
+        if ! pki --gen --type rsa --size 4096 --outform pem --builder rsa > "$CA_KEY" 2>/dev/null; then
+            info "PKI failed, using OpenSSL for CA key generation..."
+            openssl genrsa -out "$CA_KEY" 4096
+        fi
+        chmod 600 "$CA_KEY"
     fi
     
     if [[ ! -f "$CA_CRT" ]]; then
-        pki --self --ca --lifetime 3650 --in "$CA_KEY" --type rsa \
-            --dn "CN=${ORG_NAME} VPN CA" --outform pem > "$CA_CRT"
+        info "Generating CA certificate..."
+        if ! pki --self --ca --lifetime 3650 --in "$CA_KEY" --type rsa --builder rsa \
+            --dn "CN=${ORG_NAME} VPN CA" --outform pem > "$CA_CRT" 2>/dev/null; then
+            info "PKI failed, using OpenSSL for CA certificate generation..."
+            openssl req -new -x509 -key "$CA_KEY" -out "$CA_CRT" -days 3650 \
+                -subj "/CN=${ORG_NAME} VPN CA"
+        fi
+        chmod 644 "$CA_CRT"
     fi
     
     if [[ ! -f "$SRV_KEY" ]]; then
-        pki --gen --type rsa --size 4096 --outform pem > "$SRV_KEY"
+        info "Generating server private key..."
+        if ! pki --gen --type rsa --size 4096 --outform pem --builder rsa > "$SRV_KEY" 2>/dev/null; then
+            info "PKI failed, using OpenSSL for server key generation..."
+            openssl genrsa -out "$SRV_KEY" 4096
+        fi
+        chmod 600 "$SRV_KEY"
     fi
     
     if [[ ! -f "$SRV_CRT" ]]; then
+        info "Generating server certificate..."
         TMP_CSR="$(mktemp)"
-        pki --req --type rsa --in "$SRV_KEY" \
-            --dn "CN=${VPN_DOMAIN}" --san "${VPN_DOMAIN}" --outform pem > "$TMP_CSR"
-        pki --issue --cacert "$CA_CRT" --cakey "$CA_KEY" --type rsa --lifetime 1825 \
+        if ! pki --req --type rsa --in "$SRV_KEY" --builder rsa \
+            --dn "CN=${VPN_DOMAIN}" --san "${VPN_DOMAIN}" --outform pem > "$TMP_CSR" 2>/dev/null; then
+            info "PKI failed, using OpenSSL for server certificate request..."
+            openssl req -new -key "$SRV_KEY" -out "$TMP_CSR" \
+                -subj "/CN=${VPN_DOMAIN}" -addext "subjectAltName=DNS:${VPN_DOMAIN}"
+        fi
+        
+        if ! pki --issue --cacert "$CA_CRT" --cakey "$CA_KEY" --type rsa --builder rsa --lifetime 1825 \
             --in "$TMP_CSR" --flag serverAuth --flag ikeIntermediate --san "${VPN_DOMAIN}" \
-            --outform pem > "$SRV_CRT"
+            --outform pem > "$SRV_CRT" 2>/dev/null; then
+            info "PKI failed, using OpenSSL for server certificate issuance..."
+            openssl x509 -req -in "$TMP_CSR" -CA "$CA_CRT" -CAkey "$CA_KEY" \
+                -out "$SRV_CRT" -days 1825 -CAcreateserial \
+                -extensions v3_req -extfile <(echo -e "[v3_req]\nsubjectAltName=DNS:${VPN_DOMAIN}\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth")
+        fi
+        chmod 644 "$SRV_CRT"
         rm -f "$TMP_CSR"
     fi
+    
+    # Verify the keys and certificates are valid
+    info "Verifying generated keys and certificates..."
+    if ! pki --print --in "$CA_KEY" >/dev/null 2>&1 && ! openssl rsa -in "$CA_KEY" -check -noout >/dev/null 2>&1; then
+        die "CA key verification failed"
+    fi
+    if ! pki --print --in "$SRV_KEY" >/dev/null 2>&1 && ! openssl rsa -in "$SRV_KEY" -check -noout >/dev/null 2>&1; then
+        die "Server key verification failed"
+    fi
+    
+    # Verify certificates exist and are valid
+    if [ ! -s "$CA_CRT" ]; then
+        die "CA certificate is missing or empty"
+    fi
+    if [ ! -s "$SRV_CRT" ]; then
+        die "Server certificate is missing or empty"
+    fi
+    
+    # Test certificate validity
+    if ! openssl x509 -in "$CA_CRT" -noout >/dev/null 2>&1; then
+        die "CA certificate is invalid"
+    fi
+    if ! openssl x509 -in "$SRV_CRT" -noout >/dev/null 2>&1; then
+        die "Server certificate is invalid"
+    fi
+    
+    # Create symlinks in the main swanctl directory for compatibility
+    info "Creating certificate symlinks..."
+    ln -sf "$CA_CRT" "$SWAN_DIR/ca.crt"
+    ln -sf "$SRV_CRT" "$SWAN_DIR/server.crt"
+    ln -sf "$CA_KEY" "$SWAN_DIR/ca.key"
+    ln -sf "$SRV_KEY" "$SWAN_DIR/server.key"
+    
+    info "All certificates and keys verified successfully"
 }
 
 write_swanctl_conf() {
@@ -176,7 +244,25 @@ start_and_load() {
     info "Starting strongSwan and loading configuration…"
     systemctl enable strongswan-starter
     systemctl start strongswan-starter
-    swanctl --load-all
+    
+    # Wait for charon to be ready
+    info "Waiting for charon daemon to start..."
+    local retries=0
+    while [ $retries -lt 30 ]; do
+        if systemctl is-active --quiet strongswan-starter && [ -S /var/run/charon.vici ]; then
+            break
+        fi
+        sleep 1
+        retries=$((retries + 1))
+    done
+    
+    if [ $retries -eq 30 ]; then
+        warn "charon daemon may not be ready, but continuing..."
+    fi
+    
+    # Load configuration
+    info "Loading swanctl configuration..."
+    swanctl --load-all || warn "Failed to load configuration, but continuing..."
 }
 
 ensure_nat() {
@@ -201,10 +287,34 @@ add_client() {
     mkdir -p "$cdir"
     info "Creating client '$name' (ID: $local_id)…"
     
-    pki --gen --type rsa --size 4096 --outform pem > "$cdir/key.pem"
-    pki --req --type rsa --in "$cdir/key.pem" --dn "CN=${name}" --san "$local_id" --outform pem > "$cdir/req.csr"
-    pki --issue --cacert "$CA_CRT" --cakey "$CA_KEY" --type rsa --lifetime 730 \
-        --in "$cdir/req.csr" --flag clientAuth --outform pem > "$cdir/cert.pem"
+    info "Generating client private key..."
+    if ! pki --gen --type rsa --size 4096 --outform pem --builder rsa > "$cdir/key.pem" 2>/dev/null; then
+        info "PKI failed, using OpenSSL for client key generation..."
+        openssl genrsa -out "$cdir/key.pem" 4096
+    fi
+    chmod 600 "$cdir/key.pem"
+    
+    info "Generating client certificate request..."
+    if ! pki --req --type rsa --in "$cdir/key.pem" --builder rsa --dn "CN=${name}" --san "$local_id" --outform pem > "$cdir/req.csr" 2>/dev/null; then
+        info "PKI failed, using OpenSSL for client certificate request..."
+        openssl req -new -key "$cdir/key.pem" -out "$cdir/req.csr" \
+            -subj "/CN=${name}" -addext "subjectAltName=DNS:${local_id}"
+    fi
+    
+    info "Issuing client certificate..."
+    if ! pki --issue --cacert "$CA_CRT" --cakey "$CA_KEY" --type rsa --builder rsa --lifetime 730 \
+        --in "$cdir/req.csr" --flag clientAuth --outform pem > "$cdir/cert.pem" 2>/dev/null; then
+        info "PKI failed, using OpenSSL for client certificate issuance..."
+        openssl x509 -req -in "$cdir/req.csr" -CA "$CA_CRT" -CAkey "$CA_KEY" \
+            -out "$cdir/cert.pem" -days 730 -CAcreateserial \
+            -extensions v3_req -extfile <(echo -e "[v3_req]\nsubjectAltName=DNS:${local_id}\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth")
+    fi
+    chmod 644 "$cdir/cert.pem"
+    
+    # Verify the client key is valid
+    if ! pki --print --in "$cdir/key.pem" >/dev/null 2>&1 && ! openssl rsa -in "$cdir/key.pem" -check -noout >/dev/null 2>&1; then
+        die "Client key verification failed"
+    fi
     
     openssl pkcs12 -export -legacy -descert \
         -name "$name" -inkey "$cdir/key.pem" -in "$cdir/cert.pem" -certfile "$CA_CRT" \
@@ -286,13 +396,85 @@ EOF
 }
 
 reload_swan() {
-    swanctl --load-all
+    info "Reloading strongSwan configuration..."
+    if [ -S /var/run/charon.vici ]; then
+        swanctl --load-all
+        info "Configuration reloaded successfully"
+    else
+        warn "VICI socket not available, starting strongSwan first..."
+        systemctl start strongswan-starter
+        sleep 3
+        if [ -S /var/run/charon.vici ]; then
+            swanctl --load-all
+            info "Configuration loaded successfully"
+        else
+            die "Failed to start strongSwan or load configuration"
+        fi
+    fi
 }
 
 show_status() {
+    echo "=== StrongSwan Service Status ==="
     systemctl status strongswan-starter --no-pager || true
+    
+    echo -e "\n=== VICI Socket Status ==="
+    if [ -S /var/run/charon.vici ]; then
+        echo "✅ VICI socket is available"
+    else
+        echo "❌ VICI socket not found"
+    fi
+    
+    echo -e "\n=== Connections ==="
     swanctl --list-conns || true
+    
+    echo -e "\n=== Pools ==="
     swanctl --list-pools || true
+    
+    echo -e "\n=== Secrets ==="
+    swanctl --list-secrets || true
+}
+
+show_help() {
+    cat <<EOF
+StrongSwan IKEv2 VPN Setup Script
+
+USAGE:
+    $0 [COMMAND] [OPTIONS]
+
+COMMANDS:
+    setup                 Set up strongSwan VPN server (default)
+    add-client <name>     Add a new VPN client
+    reload                Reload strongSwan configuration
+    status                Show strongSwan status and connections
+    help                  Show this help message
+
+EXAMPLES:
+    $0 setup                    # Initial setup
+    $0 add-client john          # Add client named 'john'
+    $0 add-client jane jane-id  # Add client with custom ID
+    $0 reload                   # Reload configuration
+    $0 status                   # Check status
+
+ENVIRONMENT VARIABLES:
+    VPN_DOMAIN          VPN server domain (default: vpn.example.com)
+    ORG_NAME            Organization name (default: Example Org)
+    POOL_V4             Client IP pool (default: 10.10.11.193/26)
+    DNS_CSV             DNS servers (default: 1.1.1.1,9.9.9.9)
+    IKE_PROPOSALS       IKE proposals (default: aes256gcm16-prfsha384-ecp384)
+    ESP_PROPOSALS       ESP proposals (default: aes256gcm16-ecp384)
+    FULL_TUNNEL         Full tunnel mode (default: 1)
+    LOCAL_SUBNETS       Local subnets to route (default: 10.10.10.0/22)
+    ENABLE_NAT          Enable NAT (default: 1)
+
+FILES:
+    /etc/swanctl/swanctl.conf           Main configuration
+    /etc/swanctl/private/               Private keys
+    /etc/swanctl/x509ca/                CA certificates
+    /etc/swanctl/x509/                  Server certificates
+    /var/lib/roadwarrior/clients/       Client certificates
+
+For more information, see: https://github.com/sec-ml/strongswan_build
+EOF
 }
 
 main() {
@@ -319,8 +501,13 @@ main() {
         status)
             show_status
             ;;
+        help|--help|-h)
+            show_help
+            ;;
         *)
-            die "Unknown command: $cmd"
+            echo "Unknown command: $cmd"
+            echo "Use '$0 help' for usage information"
+            exit 1
             ;;
     esac
 }
