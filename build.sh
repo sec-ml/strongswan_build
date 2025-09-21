@@ -33,7 +33,7 @@ ensure_packages() {
   apt-get update -y
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
     strongswan-starter strongswan-swanctl strongswan-pki \
-    libstrongswan-extra-plugins openssl uuid-runtime \
+    libstrongswan-standard-plugins libstrongswan-extra-plugins openssl uuid-runtime \
     iptables-persistent ca-certificates
 }
 
